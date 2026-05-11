@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
 Protocol2 Test Tool - GUI для тестирования связи с контроллером дефектоскопа.
-Использует PySide6 и QtSerialPort.
+Использует PySide6 и PySerial.
 """
 
 import sys
+import threading
+import serial
+import serial.tools.list_ports
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, Signal, Slot, QIODevice, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, Slot, QObject
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QGroupBox, QPushButton, QLabel, QComboBox, QSpinBox,
     QDoubleSpinBox, QCheckBox, QLineEdit, QTextEdit, QSplitter,
-    QMessageBox, QGridLayout, QFrame, QListWidget
+    QMessageBox, QGridLayout, QListWidget
 )
-from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 from PySide6.QtGui import QTextCursor, QTextCharFormat, QColor
 
 # ----------------------------------------------------------------------------
@@ -33,12 +35,12 @@ QPushButton {
 }
 """
 
-COLOR_SENT  = "#569cd6"   # команды отправленные
-COLOR_OK    = "#6a9955"   # OK
-COLOR_ERR   = "#f44747"   # ERR
-COLOR_DATA  = "#ce9178"   # DATA (ответ на запрос)
-COLOR_ASYNC = "#d7ba7d"   # DATA (асинхронное событие)
-COLOR_INFO  = "#9cdcfe"   # информационные
+COLOR_SENT  = "#569cd6"
+COLOR_OK    = "#6a9955"
+COLOR_ERR   = "#f44747"
+COLOR_DATA  = "#ce9178"
+COLOR_ASYNC = "#d7ba7d"
+COLOR_INFO  = "#9cdcfe"
 
 
 class LogTextEdit(QTextEdit):
@@ -50,89 +52,123 @@ class LogTextEdit(QTextEdit):
         self.setUndoRedoEnabled(False)
         self.setStyleSheet(STYLE_SHEET)
         self.setMinimumHeight(100)
-        # Явно задаём моноширинный шрифт
         self.setFontFamily("Consolas, monospace")
         self.setFontPointSize(10)
 
     def append_log(self, text: str, color: str = None):
-        """Добавить строку с меткой времени и (опционально) цветом."""
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]   # миллисекунды
-
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.End)
-
-        # Создаём формат с нужным цветом
         fmt = QTextCharFormat()
         if color:
             fmt.setForeground(QColor(color))
-
-        # Вставляем текст с переводом строки
         cursor.insertText(f"[{ts}] {text}\n", fmt)
-
-        # Прокручиваем к последней строке
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
 
 class SerialComm(QObject):
-    """Обёртка над QSerialPort."""
-    line_received = Signal(str)           # пришедшая полезная строка
-    connection_changed = Signal(bool)     # True - подключено
+    """
+    Обёртка над PySerial с фоновым потоком чтения.
+
+    Чтение строк происходит в отдельном потоке — GUI не блокируется.
+    Сигналы Qt обеспечивают потокобезопасную доставку данных в GUI.
+    """
+    line_received      = Signal(str)
+    connection_changed = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.port = QSerialPort(self)
-        self.port.readyRead.connect(self.on_ready_read)
-        self.port.errorOccurred.connect(self.on_error)
-        self.buffer = ""
+        self._port: serial.Serial | None = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._reader_thread: threading.Thread | None = None
 
-    def list_ports(self):
-        return [port.portName() for port in QSerialPortInfo.availablePorts()]
+    # ------------------------------------------------------------------
+    def list_ports(self) -> list[str]:
+        return sorted(p.device for p in serial.tools.list_ports.comports())
 
-    def connect_port(self, port_name: str, baud_rate: int = 115200):
-        if self.port.isOpen():
-            self.port.close()
-        self.port.setPortName(port_name)
-        self.port.setBaudRate(baud_rate)
-        self.port.setDataBits(QSerialPort.Data8)
-        self.port.setParity(QSerialPort.NoParity)
-        self.port.setStopBits(QSerialPort.OneStop)
-        self.port.setFlowControl(QSerialPort.NoFlowControl)
-        if self.port.open(QIODevice.ReadWrite):
-            self.connection_changed.emit(True)
-            return True
-        else:
-            self.connection_changed.emit(False)
+    # ------------------------------------------------------------------
+    def connect_port(self, port_name: str, baud_rate: int = 115200) -> bool:
+        self.disconnect_port()
+        try:
+            port = serial.Serial(
+                port=port_name,
+                baudrate=baud_rate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=1,
+                write_timeout=2,
+                # Не поднимать DTR/RTS при открытии — иначе ESP32-S3
+                # получает сигнал сброса через схему авторесета USB CDC.
+                dsrdtr=False,
+                rtscts=False,
+            )
+        except serial.SerialException:
             return False
 
+        with self._lock:
+            self._port = port
+
+        self._stop_event.clear()
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="serial-reader"
+        )
+        self._reader_thread.start()
+        self.connection_changed.emit(True)
+        return True
+
+    # ------------------------------------------------------------------
     def disconnect_port(self):
-        if self.port.isOpen():
-            self.port.close()
-            self.connection_changed.emit(False)
+        self._stop_event.set()
+        with self._lock:
+            if self._port and self._port.is_open:
+                try:
+                    self._port.close()
+                except serial.SerialException:
+                    pass
+            self._port = None
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2)
+        self._reader_thread = None
 
+    # ------------------------------------------------------------------
     def send(self, data: str):
-        if not self.port.isOpen():
-            return
         raw = (data.strip() + "\r\n").encode("utf-8")
-        self.port.write(raw)
+        with self._lock:
+            if not self._port or not self._port.is_open:
+                return
+            try:
+                self._port.write(raw)
+                self._port.flush()
+            except serial.SerialException:
+                pass
 
-    @Slot()
-    def on_ready_read(self):
-        data = self.port.readAll().data().decode("utf-8", errors="replace")
-        self.buffer += data
-        while True:
-            idx = self.buffer.find("\n")
-            if idx == -1:
+    # ------------------------------------------------------------------
+    def _reader_loop(self):
+        """Фоновый поток: читает строки и пробрасывает их в GUI через сигнал."""
+        while not self._stop_event.is_set():
+            try:
+                with self._lock:
+                    port = self._port
+                if port is None or not port.is_open:
+                    break
+                # readline() ждёт '\n' или таймаута (timeout=1 сек)
+                raw = port.readline()
+            except serial.SerialException:
+                if not self._stop_event.is_set():
+                    self.connection_changed.emit(False)
                 break
-            line = self.buffer[:idx].strip()
-            self.buffer = self.buffer[idx + 1:]
-            if line:                           # игнорируем пустые строки
-                self.line_received.emit(line)
+            except Exception:
+                break
 
-    @Slot(QSerialPort.SerialPortError)
-    def on_error(self, error):
-        if error != QSerialPort.NoError:
-            self.connection_changed.emit(False)
+            if not raw:
+                continue
+
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                self.line_received.emit(line)
 
 
 class MainWindow(QMainWindow):
@@ -141,21 +177,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Protocol2 Test Tool — Дефектоскоп TPU-TNDT")
         self.resize(1000, 700)
 
-        # Serial
         self.serial = SerialComm(self)
         self.serial.line_received.connect(self.process_incoming)
         self.serial.connection_changed.connect(self.on_connection_changed)
         self.connected = False
 
-        # Таймер авто-ping
         self.ping_timer = QTimer(self)
         self.ping_timer.timeout.connect(self.send_ping)
         self.ping_timer.setInterval(2500)
 
-        # Строим интерфейс
         self._setup_ui()
-
-        # Заполняем список портов
         self.refresh_ports()
 
     # --------------------------------------------------------------------
@@ -166,7 +197,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
 
-        # --- Верхняя панель соединения ---
         top = QHBoxLayout()
         top.addWidget(QLabel("COM порт:"))
         self.cmb_port = QComboBox()
@@ -198,7 +228,6 @@ class MainWindow(QMainWindow):
         top.addWidget(self.chk_auto_ping)
         main_layout.addLayout(top)
 
-        # --- Разделитель: вкладки + лог ---
         splitter = QSplitter(Qt.Vertical)
         self.tab_widget = QTabWidget()
         self._build_heat_tab()
@@ -216,7 +245,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         main_layout.addWidget(splitter)
 
-    # --- Вкладки (код без изменений, сокращён для краткости) ---
+    # ------------------------------------------------------------------
     def _build_heat_tab(self):
         tab = QWidget()
         ly = QVBoxLayout(tab)
@@ -283,7 +312,6 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         ly = QGridLayout(tab)
 
-        # CONST
         ly.addWidget(QLabel("Постоянная яркость:"), 0, 0)
         self.spin_const_bright = QSpinBox()
         self.spin_const_bright.setRange(0, 255)
@@ -293,7 +321,6 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(self.cmd_led_const)
         ly.addWidget(btn, 0, 2)
 
-        # BLINK
         ly.addWidget(QLabel("Период(мс):"), 1, 0)
         self.spin_blink_period = QSpinBox()
         self.spin_blink_period.setRange(10, 10000)
@@ -314,7 +341,6 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(self.cmd_led_blink)
         ly.addWidget(btn, 1, 6)
 
-        # PULSE
         ly.addWidget(QLabel("Период(мс):"), 2, 0)
         self.spin_pulse_period = QSpinBox()
         self.spin_pulse_period.setRange(10, 10000)
@@ -329,7 +355,6 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(self.cmd_led_pulse)
         ly.addWidget(btn, 2, 4)
 
-        # FLASH
         ly.addWidget(QLabel("Кол-во:"), 3, 0)
         self.spin_flash_count = QSpinBox()
         self.spin_flash_count.setRange(1, 100)
@@ -420,6 +445,7 @@ class MainWindow(QMainWindow):
         hly = QHBoxLayout()
         self.raw_cmd = QLineEdit()
         self.raw_cmd.setPlaceholderText("например HEAT ON LEFT")
+        self.raw_cmd.returnPressed.connect(self.cmd_raw_send)
         hly.addWidget(self.raw_cmd)
         btn = QPushButton("Отправить")
         btn.clicked.connect(self.cmd_raw_send)
@@ -447,9 +473,8 @@ class MainWindow(QMainWindow):
         self.send_command(f"HEAT ON {target}")
 
     def cmd_heat_off(self):
+        # split()[0] из "ALL (выкл)" уже даёт "ALL" — дополнительная замена не нужна
         target = self.heat_channel.currentText().split()[0]
-        if target == "ALL (выкл)":
-            target = "ALL"
         self.send_command(f"HEAT OFF {target}")
 
     def cmd_heat_status(self):
@@ -464,9 +489,8 @@ class MainWindow(QMainWindow):
         self.send_command(f"LIGHT ON {ch}")
 
     def cmd_light_off(self):
+        # split()[0] из "ALL (выкл)" уже даёт "ALL"
         ch = self.light_channel.currentText().split()[0]
-        if ch == "ALL (выкл)":
-            ch = "ALL"
         self.send_command(f"LIGHT OFF {ch}")
 
     def cmd_light_set(self):
@@ -482,25 +506,22 @@ class MainWindow(QMainWindow):
 
     # --- LED ---
     def cmd_led_const(self):
-        b = self.spin_const_bright.value()
-        self.send_command(f"LED CONST {b}")
+        self.send_command(f"LED CONST {self.spin_const_bright.value()}")
 
     def cmd_led_blink(self):
         per = self.spin_blink_period.value()
-        b = self.spin_blink_bright.value()
-        d = self.spin_blink_duty.value()
+        b   = self.spin_blink_bright.value()
+        d   = self.spin_blink_duty.value()
         self.send_command(f"LED BLINK {per} {b} {d:.2f}")
 
     def cmd_led_pulse(self):
-        per = self.spin_pulse_period.value()
-        b = self.spin_pulse_bright.value()
-        self.send_command(f"LED PULSE {per} {b}")
+        self.send_command(f"LED PULSE {self.spin_pulse_period.value()} {self.spin_pulse_bright.value()}")
 
     def cmd_led_flash(self):
         cnt = self.spin_flash_count.value()
-        on = self.spin_flash_on.value()
+        on  = self.spin_flash_on.value()
         off = self.spin_flash_off.value()
-        b = self.spin_flash_bright.value()
+        b   = self.spin_flash_bright.value()
         self.send_command(f"LED FLASH {cnt} {on} {off} {b}")
 
     def cmd_led_stop(self):
@@ -514,8 +535,7 @@ class MainWindow(QMainWindow):
         self.send_command("SYS PING", COLOR_INFO)
 
     def cmd_sys_set_mode(self):
-        mode = self.cmb_mode.currentText()
-        self.send_command(f"SYS MODE {mode}")
+        self.send_command(f"SYS MODE {self.cmb_mode.currentText()}")
 
     def cmd_sys_get_mode(self):
         self.send_command("SYS MODE")
@@ -565,7 +585,6 @@ class MainWindow(QMainWindow):
 
         self.log.append_log(f"<<< {line}", color)
 
-        # Дополнительная обработка DATA HEAT
         if parts[0] == "DATA" and len(parts) >= 3 and parts[1] == "HEAT":
             self.lbl_heat_status.setText(f"Последний статус: {line}")
 
@@ -582,6 +601,11 @@ class MainWindow(QMainWindow):
     def toggle_connection(self):
         if self.connected:
             self.serial.disconnect_port()
+            self.connected = False
+            self.btn_connect.setText("Подключить")
+            self.lbl_status.setText("● Нет соединения")
+            self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+            self.chk_auto_ping.setChecked(False)
         else:
             port = self.cmb_port.currentText()
             baud = int(self.cmb_baud.currentText())
@@ -589,15 +613,17 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Ошибка", "Выберите COM порт.")
                 return
             if self.serial.connect_port(port, baud):
+                self.connected = True
                 self.btn_connect.setText("Отключить")
                 self.lbl_status.setText(f"● Подключено к {port}")
                 self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
                 self.log.append_log(f"Подключено к {port} на {baud} бод", COLOR_INFO)
-                self.connected = True
             else:
                 QMessageBox.critical(self, "Ошибка", f"Не удалось открыть порт {port}")
 
+    @Slot(bool)
     def on_connection_changed(self, connected: bool):
+        # Вызывается из фонового потока при неожиданном обрыве связи
         if not connected and self.connected:
             self.connected = False
             self.btn_connect.setText("Подключить")
@@ -606,7 +632,7 @@ class MainWindow(QMainWindow):
             self.log.append_log("Соединение потеряно", COLOR_ERR)
             self.chk_auto_ping.setChecked(False)
 
-    def on_auto_ping_toggled(self, checked):
+    def on_auto_ping_toggled(self, checked: bool):
         if checked:
             self.ping_timer.start()
         else:
